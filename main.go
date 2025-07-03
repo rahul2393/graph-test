@@ -9,18 +9,24 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"contrib.go.opencensus.io/exporter/jaeger"
+	"go.opencensus.io/plugin/ocgrpc"
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"github.com/rahul2393/spanner-experiments/irahul-graph-test/metrics"
+	"go.opencensus.io/trace"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -40,7 +46,7 @@ var (
 	TEST_DURATION_SEC      = 0                              // 测试持续时间(秒)，0表示使用顶点数量模式
 	instanceID             = "irahul-load-test"
 	GRAPH_NAME             = "g0618"
-	credentialsFile        = "sa2.json" // GCP credentials file path
+	credentialsFile        = "sa2.json"                     // GCP credentials file path
 	projectID              = "span-cloud-testing"
 	databaseID             = "graphdb"
 
@@ -50,6 +56,67 @@ var (
 	errorInserts   uint64 = 0
 	currentTPS     uint64 = 0
 )
+
+const gfeT4T7prefix = "gfet4t7; dur="
+const serverTimingKey = "server-timing"
+
+var serverTimingPattern = regexp.MustCompile(`([a-zA-Z0-9_-]+);\s*dur=(\d*\.?\d+)`)
+
+// parseT4T7Latency parse the headers and trailers for finding the gfet4t7 latency.
+func parseT4T7Latency(md metadata.MD) (time.Duration, error) {
+	if md == nil {
+		return 0, fmt.Errorf("server-timing headers not found")
+	}
+
+	serverTiming := md.Get(serverTimingKey)
+
+	if len(serverTiming) == 0 {
+		return 0, fmt.Errorf("server-timing headers not found")
+	}
+
+	for _, timing := range serverTiming {
+		matches := serverTimingPattern.FindAllStringSubmatch(timing, -1)
+		for _, match := range matches {
+			if len(match) == 3 { // full match + 2 capture groups
+				metricName := match[1]
+				duration, err := strconv.ParseFloat(match[2], 10)
+				if err != nil {
+					return 0, fmt.Errorf("failed to parse gfe latency: %v", err)
+
+				}
+				if metricName == "gfet4t7" {
+					return time.Duration(duration*1000) * time.Microsecond, nil
+				}
+			}
+		}
+	}
+	return 0, fmt.Errorf("no gfe latency response available")
+}
+
+func initOpenCensusTracer() func() {
+	// Create Jaeger exporter for OpenCensus
+	exporter, err := jaeger.NewExporter(jaeger.Options{
+		CollectorEndpoint: "http://localhost:14268/api/traces",
+		Process: jaeger.Process{
+			ServiceName: "spanner-graph-test",
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	// Register the exporter
+	trace.RegisterExporter(exporter)
+
+	// Configure sampling - sample all traces
+	trace.ApplyConfig(trace.Config{
+		DefaultSampler: trace.ProbabilitySampler(0.1),
+	})
+
+	return func() {
+		exporter.Flush()
+	}
+}
 
 // initFromEnv initializes configuration from environment variables
 func initFromEnv() {
@@ -939,14 +1006,20 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 				mutation := buildVertexMutation(vertex)
 
 				// Execute insert
+				var span *trace.Span
+				ctx, span = trace.StartSpan(ctx, "write-vertex-test")
 				insertStart := time.Now()
 				_, err := client.Apply(ctx, []*spanner.Mutation{mutation}, spanner.ApplyAtLeastOnce())
 				insertDuration := time.Since(insertStart)
 
 				// Record metrics
 				metricsCollector.AddDuration(workerID, insertDuration)
+				if err != nil {
+					panic(err)
+				}
 
 				if err != nil {
+					span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: err.Error()})
 					if ctx.Err() != nil {
 						// Context was cancelled, exit gracefully
 						log.Printf("Worker %d stopping due to context cancellation", workerID)
@@ -959,6 +1032,7 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 					workerSuccessCount++
 					metricsCollector.AddSuccess(1)
 				}
+				span.End()
 
 				// Log progress every 100 inserts
 				if (i-startIdx+1)%100 == 0 {
@@ -1170,6 +1244,9 @@ func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, w
 
 		// Build and execute mutation
 		mutation := buildVertexMutation(vertex)
+		var span *trace.Span
+		ctx, span = trace.StartSpan(ctx, "write-vertex-worker-improved")
+
 		insertStart := time.Now()
 		_, err := client.Apply(ctx, []*spanner.Mutation{mutation}, spanner.ApplyAtLeastOnce())
 		insertDuration := time.Since(insertStart)
@@ -1180,6 +1257,7 @@ func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, w
 		metricsCollector.AddDuration(workerID, insertDuration)
 
 		if err != nil {
+			span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: err.Error()})
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -1192,7 +1270,7 @@ func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, w
 			atomic.AddUint64(&successInserts, 1)
 			metricsCollector.AddSuccess(1)
 		}
-
+		span.End()
 		// Log progress every 100 inserts
 		if workerSuccessCount%100 == 0 && workerSuccessCount > 0 {
 			log.Printf("Worker %d processed %d vertices (success: %d, errors: %d, avg latency: %.2fms)",
@@ -1210,8 +1288,64 @@ func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, w
 	return nil
 }
 
+// AddGFELatencyUnaryInterceptor intercepts unary client requests (spanner.Commit, spanner.ExecuteSQL) and annotates GFE latency.
+func AddGFELatencyUnaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	ctx, span := trace.StartSpan(ctx, "UnaryT4T7Interceptor")
+	defer span.End()
+
+	var headers metadata.MD
+	opts = append(opts, grpc.Header(&headers))
+	if err := invoker(ctx, method, req, reply, cc, opts...); err != nil {
+		return err
+	}
+
+	if span.SpanContext().IsSampled() {
+		gfeLatency, err := parseT4T7Latency(headers)
+		if err != nil {
+			span.AddAttributes(trace.StringAttribute("Error", err.Error()))
+		} else {
+			span.AddAttributes(trace.StringAttribute("Latency", gfeLatency.String()))
+		}
+	}
+	return nil
+}
+
+// AddGFELatencyStreamingInterceptor intercepts streaming requests StreamingSQL and annotates GFE latency.
+func AddGFELatencyStreamingInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	ctx, span := trace.StartSpan(ctx, "StreamingT4T7Interceptor")
+
+	var headers metadata.MD
+	opts = append(opts, grpc.Header(&headers))
+
+	cs, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: err.Error()})
+		span.End()
+		return cs, err
+	}
+
+	if span.SpanContext().IsSampled() {
+		go func() {
+			<-ctx.Done()
+			gfeLatency, parseErr := parseT4T7Latency(headers)
+			if parseErr != nil {
+				span.AddAttributes(trace.StringAttribute("Error", parseErr.Error()))
+			} else {
+				span.AddAttributes(trace.StringAttribute("Latency", gfeLatency.String()))
+			}
+			span.End()
+		}()
+	}
+	return cs, nil
+}
+
 func main() {
+	cleanup := initOpenCensusTracer()
+	defer cleanup()
+
 	initFromEnv()
+
 	// Define command line flags
 	var testType string
 	var startZone, endZone int
@@ -1230,10 +1364,17 @@ func main() {
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS", "true")
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW", "true")
 	os.Setenv("SPANNER_DISABLE_BUILTIN_METRICS", "true")
+	clientOpts := []option.ClientOption{
+		option.WithGRPCDialOption(grpc.WithUnaryInterceptor(AddGFELatencyUnaryInterceptor)),
+		option.WithGRPCDialOption(grpc.WithStreamInterceptor(AddGFELatencyStreamingInterceptor)),
+		option.WithGRPCDialOption(grpc.WithStatsHandler(&ocgrpc.ClientHandler{})),
+		option.WithCredentialsFile(credentialsFile),
+		option.WithGRPCConnectionPool(16),
+	}
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{
 		SessionPoolConfig: spanner.SessionPoolConfig{MaxOpened: 1, MinOpened: 1},
-	}, option.WithCredentialsFile(credentialsFile),
-		option.WithGRPCConnectionPool(16),
+	},
+		clientOpts...,
 	)
 	if err != nil {
 		log.Fatalf("Failed to create Spanner client: %v", err)
