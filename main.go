@@ -110,7 +110,8 @@ func initOpenTelemetryTracer() func() {
 	tp := trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
 		//trace.WithSampler(trace.AlwaysSample()),
-		trace.WithSampler(trace.TraceIDRatioBased(0.1)), // Sample all traces for debugging
+		trace.WithSampler(trace.NeverSample()),
+		//trace.WithSampler(trace.TraceIDRatioBased(0.001)), // Sample all traces for debugging
 	)
 
 	// Set the global trace provider
@@ -1396,15 +1397,15 @@ func main() {
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW", "true")
 	os.Setenv("SPANNER_DISABLE_BUILTIN_METRICS", "true")
 	os.Setenv("SPANNER_DISABLE_DIRECT_ACCESS_GRPC_BUILTIN_METRICS", "true")
-	os.Setenv("SPANNER_DISABLE_AFE_SERVER_TIMING", "false")
+	os.Setenv("SPANNER_DISABLE_AFE_SERVER_TIMING", "true")
 	os.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	// Enable comprehensive tracing for Spanner client operations
 
 	clientOpts := []option.ClientOption{
 		//option.WithCredentialsFile(credentialsFile),
 		option.WithGRPCConnectionPool(16),
-		option.WithGRPCDialOption(grpc.WithUnaryInterceptor(AddGFELatencyUnaryInterceptor)),
-		option.WithGRPCDialOption(grpc.WithStreamInterceptor(AddGFELatencyStreamingInterceptor)),
+		//option.WithGRPCDialOption(grpc.WithUnaryInterceptor(AddGFELatencyUnaryInterceptor)),
+		//option.WithGRPCDialOption(grpc.WithStreamInterceptor(AddGFELatencyStreamingInterceptor)),
 	}
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{
 		SessionPoolConfig: spanner.SessionPoolConfig{MaxOpened: 1, MinOpened: 1},
