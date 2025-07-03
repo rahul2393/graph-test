@@ -12,11 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"github.com/rahul2393/spanner-experiments/irahul-graph-test/metrics"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	"google.golang.org/grpc/status"
@@ -35,11 +37,18 @@ var (
 	ShuffleProcessingOrder = false                          // 是否随机化处理顺序以避免热点
 	MaxCommitDelayMs       = 100                            // 最大提交延迟(毫秒)，用于提高写入吞吐量
 	BATCH_NUM              = 1                              // 批量写入大小
+	TEST_DURATION_SEC      = 0                              // 测试持续时间(秒)，0表示使用顶点数量模式
 	instanceID             = "irahul-load-test"
 	GRAPH_NAME             = "g0618"
 	credentialsFile        = "sa2.json" // GCP credentials file path
 	projectID              = "span-cloud-testing"
 	databaseID             = "graphdb"
+
+	// Atomic counters for metrics
+	totalInserts   uint64 = 0
+	successInserts uint64 = 0
+	errorInserts   uint64 = 0
+	currentTPS     uint64 = 0
 )
 
 // initFromEnv initializes configuration from environment variables
@@ -129,6 +138,13 @@ func initFromEnv() {
 		}
 	}
 
+	// Initialize TEST_DURATION_SEC from environment variable
+	if testDurationStr := os.Getenv("TEST_DURATION_SEC"); testDurationStr != "" {
+		if parsedTestDuration, err := strconv.Atoi(testDurationStr); err == nil && parsedTestDuration >= 0 {
+			TEST_DURATION_SEC = parsedTestDuration
+		}
+	}
+
 	// Initialize credentialsFile from environment variable
 	if credFile := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_FILE"); credFile != "" {
 		credentialsFile = credFile
@@ -144,8 +160,8 @@ func initFromEnv() {
 		databaseID = dbID
 	}
 
-	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, MaxCommitDelayMs=%d, BATCH_NUM=%d, credentialsFile=%s",
-		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, MaxCommitDelayMs, BATCH_NUM, credentialsFile)
+	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, MaxCommitDelayMs=%d, BATCH_NUM=%d, TEST_DURATION_SEC=%d, credentialsFile=%s",
+		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, MaxCommitDelayMs, BATCH_NUM, TEST_DURATION_SEC, credentialsFile)
 }
 
 func countdownOrExit(action string, seconds int) {
@@ -162,6 +178,40 @@ func countdownOrExit(action string, seconds int) {
 	case <-timer.C:
 		// Continue normally
 	}
+}
+
+// handleInterrupt sets up graceful shutdown on interrupt signal
+func handleInterrupt(cancel context.CancelFunc) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		log.Println("\nReceived interrupt signal, stopping workers gracefully...")
+		cancel()
+	}()
+}
+
+// startTPSMonitor starts a goroutine that logs TPS every second
+func startTPSMonitor(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				tps := atomic.SwapUint64(&currentTPS, 0) // get and reset
+				total := atomic.LoadUint64(&totalInserts)
+				success := atomic.LoadUint64(&successInserts)
+				errors := atomic.LoadUint64(&errorInserts)
+
+				log.Printf("TPS: %d | Total: %d | Success: %d | Errors: %d",
+					tps, total, success, errors)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // generateShuffledIndices creates a shuffled list of indices to randomize processing order
@@ -622,6 +672,17 @@ func setupGraphSpanner(ctx context.Context) error {
 	return nil
 }
 
+func spannerDeleteVertexUsingPDML(_ context.Context, client *spanner.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	defer cancel()
+	count, err := client.PartitionedUpdate(ctx, spanner.NewStatement("DELETE FROM Users WHERE 1 = 1"))
+	if err != nil {
+		log.Fatalf("Failed to delete all vertices: %v", err)
+	}
+	log.Printf("Successfully deleted %d vertices using PDML", count)
+	return nil
+}
+
 func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 	log.Printf("Starting Spanner batch vertex write test with batch size %d...", batchNum)
 
@@ -629,14 +690,7 @@ func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-	go func() {
-		<-interrupt
-		log.Println("\nReceived interrupt signal, stopping workers gracefully...")
-		cancel()
-	}()
-
+	handleInterrupt(cancel)
 	var wg sync.WaitGroup
 	startTime := time.Now()
 
@@ -808,14 +862,7 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-	go func() {
-		<-interrupt
-		log.Println("\nReceived interrupt signal, stopping workers gracefully...")
-		cancel()
-	}()
-
+	handleInterrupt(cancel)
 	var wg sync.WaitGroup
 	startTime := time.Now()
 
@@ -893,7 +940,7 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 
 				// Execute insert
 				insertStart := time.Now()
-				_, err := client.Apply(ctx, []*spanner.Mutation{mutation})
+				_, err := client.Apply(ctx, []*spanner.Mutation{mutation}, spanner.ApplyAtLeastOnce())
 				insertDuration := time.Since(insertStart)
 
 				// Record metrics
@@ -950,13 +997,226 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 	log.Printf("  Latency metrics: %s", combinedMetrics.String())
 }
 
+// spannerWriteVertexTestImproved performs improved vertex write testing using errgroup and duration-based testing
+func spannerWriteVertexTestImproved(client *spanner.Client, preGenerate bool) {
+	log.Println("Starting improved Spanner vertex write test...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handleInterrupt(cancel)
+	startTPSMonitor(ctx)
+
+	startTime := time.Now()
+
+	// Initialize detailed metrics collector
+	metricsCollector := metrics.NewConcurrentMetrics(VUS)
+
+	// Reset atomic counters
+	atomic.StoreUint64(&totalInserts, 0)
+	atomic.StoreUint64(&successInserts, 0)
+	atomic.StoreUint64(&errorInserts, 0)
+	atomic.StoreUint64(&currentTPS, 0)
+
+	totalVertices := ZONES_TOTAL * RECORDS_PER_ZONE
+	processingIndices := generateShuffledIndices(totalVertices)
+
+	var vertices []*VertexData
+	if preGenerate {
+		log.Println("Generating vertex data in memory...")
+		var err error
+		vertices, err = generateVertexData(ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, STR_ATTR_CNT, INT_ATTR_CNT)
+		if err != nil {
+			log.Printf("Failed to generate vertex data: %s", err.Error())
+			return
+		}
+		log.Printf("Generated %d vertices in memory", len(vertices))
+	}
+
+	// Determine test mode
+	isDurationBased := TEST_DURATION_SEC > 0
+	if isDurationBased {
+		log.Printf("Running duration-based test: %d seconds with %d workers", TEST_DURATION_SEC, VUS)
+	} else {
+		log.Printf("Running count-based test: %d vertices with %d workers", totalVertices, VUS)
+	}
+
+	log.Println("Press Ctrl+C at any time to stop gracefully...")
+	countdownOrExit("开始写入顶点", 5)
+
+	group, grpCtx := errgroup.WithContext(ctx)
+
+	// Launch workers
+	for workerID := 0; workerID < VUS; workerID++ {
+		workerID := workerID // capture loop variable
+		group.Go(func() error {
+			return writeVertexWorkerWithMetrics(grpCtx, client, workerID, vertices, processingIndices, totalVertices, preGenerate, isDurationBased, metricsCollector)
+		})
+	}
+
+	// Wait for all workers to complete
+	if err := group.Wait(); err != nil {
+		log.Printf("Worker error: %v", err)
+	}
+
+	totalDuration := time.Since(startTime)
+	final_total := atomic.LoadUint64(&totalInserts)
+	final_success := atomic.LoadUint64(&successInserts)
+	final_errors := atomic.LoadUint64(&errorInserts)
+
+	// Get combined metrics for detailed latency breakdown
+	combinedMetrics := metricsCollector.CombinedStats()
+	metricsSuccess := metricsCollector.GetSuccessCount()
+	metricsErrors := metricsCollector.GetErrorCount()
+
+	if ctx.Err() != nil {
+		log.Println("Improved vertex write test interrupted by user:")
+	} else {
+		log.Println("Improved vertex write test completed:")
+	}
+	log.Printf("  Total duration: %v", totalDuration)
+	log.Printf("  Total attempts: %d", final_total)
+	log.Printf("  Successful inserts: %d (metrics: %d)", final_success, metricsSuccess)
+	log.Printf("  Failed inserts: %d (metrics: %d)", final_errors, metricsErrors)
+	if final_total > 0 {
+		log.Printf("  Success rate: %.2f%%", float64(final_success)*100/float64(final_total))
+	}
+	log.Printf("  Throughput: %.2f vertices/sec", float64(final_success)/totalDuration.Seconds())
+	log.Printf("  Latency metrics: %s", combinedMetrics.String())
+}
+
+// writeVertexWorkerWithMetrics is a worker function for writing vertices with detailed metrics collection
+func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, workerID int, vertices []*VertexData, processingIndices []int, totalVertices int, preGenerate bool, isDurationBased bool, metricsCollector *metrics.ConcurrentMetrics) error {
+	log.Printf("Worker %d started", workerID)
+
+	var stopTimer *time.Timer
+	var done bool = false
+
+	if isDurationBased {
+		stopTimer = time.NewTimer(time.Duration(TEST_DURATION_SEC) * time.Second)
+		defer func() {
+			if stopTimer != nil {
+				stopTimer.Stop()
+			}
+		}()
+
+		go func() {
+			select {
+			case <-stopTimer.C:
+				log.Printf("Worker %d completed due to timer", workerID)
+				done = true
+			case <-ctx.Done():
+				log.Printf("Worker %d completed due to context cancellation", workerID)
+				done = true
+			}
+		}()
+	} else {
+		// Count-based mode: calculate range for this worker
+		verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
+		startIdx := workerID * verticesPerWorker
+		endIdx := (workerID + 1) * verticesPerWorker
+		if endIdx > totalVertices {
+			endIdx = totalVertices
+		}
+		log.Printf("Worker %d processing vertices %d to %d", workerID, startIdx, endIdx-1)
+	}
+
+	workerSuccessCount := 0
+	workerErrorCount := 0
+	var vertexIndex int = 0
+
+	for !done {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d stopping due to context cancellation", workerID)
+			return ctx.Err()
+		default:
+		}
+
+		var vertex *VertexData
+
+		if isDurationBased {
+			// Duration-based: cycle through vertices
+			actualIndex := processingIndices[vertexIndex%len(processingIndices)]
+			if preGenerate {
+				vertex = vertices[actualIndex]
+			} else {
+				vertex = generateVertexForIndex(actualIndex)
+			}
+			vertexIndex++
+		} else {
+			// Count-based: process assigned range
+			verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
+			startIdx := workerID * verticesPerWorker
+			endIdx := (workerID + 1) * verticesPerWorker
+			if endIdx > totalVertices {
+				endIdx = totalVertices
+			}
+
+			if vertexIndex >= (endIdx - startIdx) {
+				done = true
+				break
+			}
+
+			actualIndex := processingIndices[startIdx+vertexIndex]
+			if preGenerate {
+				vertex = vertices[actualIndex]
+			} else {
+				vertex = generateVertexForIndex(actualIndex)
+			}
+			vertexIndex++
+		}
+
+		// Build and execute mutation
+		mutation := buildVertexMutation(vertex)
+		insertStart := time.Now()
+		_, err := client.Apply(ctx, []*spanner.Mutation{mutation}, spanner.ApplyAtLeastOnce())
+		insertDuration := time.Since(insertStart)
+
+		// Record metrics - both atomic counters and detailed latency
+		atomic.AddUint64(&totalInserts, 1)
+		atomic.AddUint64(&currentTPS, 1)
+		metricsCollector.AddDuration(workerID, insertDuration)
+
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("Worker %d insert failed for UID %d: %s", workerID, vertex.UID, err.Error())
+			workerErrorCount++
+			atomic.AddUint64(&errorInserts, 1)
+			metricsCollector.AddError(1)
+		} else {
+			workerSuccessCount++
+			atomic.AddUint64(&successInserts, 1)
+			metricsCollector.AddSuccess(1)
+		}
+
+		// Log progress every 100 inserts
+		if workerSuccessCount%100 == 0 && workerSuccessCount > 0 {
+			log.Printf("Worker %d processed %d vertices (success: %d, errors: %d, avg latency: %.2fms)",
+				workerID, workerSuccessCount+workerErrorCount, workerSuccessCount, workerErrorCount,
+				float64(insertDuration.Nanoseconds())/1000000)
+		}
+
+		// Small delay to prevent overwhelming the system
+		if !isDurationBased {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	log.Printf("Worker %d completed: %d success, %d errors", workerID, workerSuccessCount, workerErrorCount)
+	return nil
+}
+
 func main() {
 	initFromEnv()
 	// Define command line flags
 	var testType string
 	var startZone, endZone int
 	var batchNum int
-	flag.StringVar(&testType, "test", "setup", "Test type to run: setup, setupindex, write-vertex, write-edge, relation, all")
+	flag.StringVar(&testType, "test", "setup", "Test type to run: setup, setupindex, write-vertex, write-vertex-improved, delete-vertex-using-pdml, write-edge, relation, all")
 	flag.IntVar(&startZone, "start-zone", ZONE_START, "Start zone ID for edge test")
 	flag.IntVar(&endZone, "end-zone", ZONE_START+ZONES_TOTAL, "End zone ID for edge test")
 	flag.IntVar(&batchNum, "batch-num", EDGES_PER_RELATION, "Number of edges per batch for edge write test")
@@ -970,11 +1230,18 @@ func main() {
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS", "true")
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW", "true")
 	os.Setenv("SPANNER_DISABLE_BUILTIN_METRICS", "true")
-	client, err := spanner.NewClient(ctx, dbPath, option.WithCredentialsFile(credentialsFile))
+	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{
+		SessionPoolConfig: spanner.SessionPoolConfig{MaxOpened: 1, MinOpened: 1},
+	}, option.WithCredentialsFile(credentialsFile),
+		option.WithGRPCConnectionPool(16),
+	)
 	if err != nil {
 		log.Fatalf("Failed to create Spanner client: %v", err)
 	}
 	defer client.Close()
+	_ = client.Single().Query(ctx, spanner.NewStatement("SELECT 1")).Do(func(row *spanner.Row) error {
+		return nil
+	})
 
 	// Execute tests based on command line option
 	switch testType {
@@ -990,7 +1257,13 @@ func main() {
 		if err := setupAllTableIndexes(ctx); err != nil {
 			log.Fatalf("Failed to setup indexes: %v", err)
 		}
-
+	case "delete-vertex-using-pdml":
+		log.Println("Running vertex deletion test using PDML...")
+		if err := spannerDeleteVertexUsingPDML(ctx, client); err != nil {
+			log.Fatalf("Failed to delete vertices using PDML: %v", err)
+		} else {
+			log.Println("Successfully deleted all vertices using PDML")
+		}
 	case "write-vertex":
 		log.Println("Running vertex write test...")
 		if BATCH_NUM > 1 {
@@ -1000,6 +1273,10 @@ func main() {
 			log.Println("Using single insert mode")
 			spannerWriteVertexTest(client, PreGenerateVertexData)
 		}
+
+	case "write-vertex-improved":
+		log.Println("Running improved vertex write test...")
+		spannerWriteVertexTestImproved(client, PreGenerateVertexData)
 
 	//case "write-edge":
 	//	log.Printf("Running edge write test for zones [%d, %d)...", startZone, endZone)
@@ -1032,7 +1309,7 @@ func main() {
 
 	default:
 		log.Printf("Unknown test type: %s", testType)
-		log.Println("Available test types: setup, setupindex, write-vertex, write-edge, relation, all")
+		log.Println("Available test types: setup, setupindex, write-vertex, write-vertex-improved, delete-vertex-using-pdml, write-edge, relation, all")
 		os.Exit(1)
 	}
 
