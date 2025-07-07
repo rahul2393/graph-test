@@ -2,6 +2,7 @@ module github.com/rahul2393/spanner-experiments/irahul-graph-test
 
 go 1.24.4
 
+replace cloud.google.com/go/spanner => ../../google-cloud-go/spanner
 
 require (
 	cloud.google.com/go/spanner v1.83.0
@@ -17,7 +18,7 @@ require (
 
 require (
 	cel.dev/expr v0.23.0 // indirect
-	cloud.google.com/go v0.121.2 // indirect
+	cloud.google.com/go v0.121.3 // indirect
 	cloud.google.com/go/auth v0.16.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect

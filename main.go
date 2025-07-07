@@ -1171,6 +1171,111 @@ func spannerWriteVertexTestImproved(client *spanner.Client, preGenerate bool) {
 	log.Printf("  Latency metrics: %s", combinedMetrics.String())
 }
 
+// spannerWriteEdgeTest performs improved edge write testing using errgroup and duration-based testing
+func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, batchNum int) {
+	log.Printf("Starting improved Spanner edge write test for zones [%d, %d) with batch size %d...", startZoneID, endZoneID, batchNum)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handleInterrupt(cancel)
+	startTPSMonitor(ctx)
+
+	startTime := time.Now()
+
+	// Initialize detailed metrics collector
+	metricsCollector := metrics.NewConcurrentMetrics(VUS)
+
+	// Reset atomic counters for edge metrics
+	atomic.StoreUint64(&totalInserts, 0)
+	atomic.StoreUint64(&successInserts, 0)
+	atomic.StoreUint64(&errorInserts, 0)
+	atomic.StoreUint64(&currentTPS, 0)
+
+	// Calculate total zones and players
+	totalZones := endZoneID - startZoneID
+	totalPlayers := int64(totalZones * RECORDS_PER_ZONE)
+	totalEdges := totalPlayers * 5 * int64(EDGES_PER_RELATION) // 5种关系，每种边数由EDGES_PER_RELATION配置
+
+	log.Printf("Total zones: %d, players per zone: %d", totalZones, RECORDS_PER_ZONE)
+	log.Printf("Total players: %d, Total edges to insert: %d", totalPlayers, totalEdges)
+
+	// Generate shuffled player indices for randomized processing order
+	playerProcessingIndices := generateShuffledPlayerIndices(int(totalPlayers))
+
+	// Determine test mode
+	isDurationBased := TEST_DURATION_SEC > 0
+	if isDurationBased {
+		log.Printf("Running duration-based edge test: %d seconds with %d workers", TEST_DURATION_SEC, VUS)
+	} else {
+		log.Printf("Running count-based edge test: %d edges with %d workers", totalEdges, VUS)
+	}
+
+	log.Println("Press Ctrl+C at any time to stop gracefully...")
+	countdownOrExit("开始写入边", 5)
+
+	group, grpCtx := errgroup.WithContext(ctx)
+
+	// Launch edge write workers
+	for workerID := 0; workerID < VUS; workerID++ {
+		workerID := workerID // capture loop variable
+		group.Go(func() error {
+			return writeEdgeWorkerWithMetrics(grpCtx, client, workerID, playerProcessingIndices,
+				startZoneID, endZoneID, batchNum, isDurationBased, metricsCollector)
+		})
+	}
+
+	// Wait for all workers to complete
+	if err := group.Wait(); err != nil {
+		log.Printf("Edge worker error: %v", err)
+	}
+
+	totalDuration := time.Since(startTime)
+	final_total := atomic.LoadUint64(&totalInserts)
+	final_success := atomic.LoadUint64(&successInserts)
+	final_errors := atomic.LoadUint64(&errorInserts)
+
+	// Get combined metrics for detailed latency breakdown
+	combinedMetrics := metricsCollector.CombinedStats()
+	metricsSuccess := metricsCollector.GetSuccessCount()
+	metricsErrors := metricsCollector.GetErrorCount()
+
+	if ctx.Err() != nil {
+		log.Println("Improved edge write test interrupted by user:")
+	} else {
+		log.Println("Improved edge write test completed:")
+	}
+	log.Printf("  Total duration: %v", totalDuration)
+	log.Printf("  Total attempts: %d", final_total)
+	log.Printf("  Expected edges: %d", totalEdges)
+	log.Printf("  Successful inserts: %d (metrics: %d)", final_success, metricsSuccess)
+	log.Printf("  Failed inserts: %d (metrics: %d)", final_errors, metricsErrors)
+	if final_total > 0 {
+		log.Printf("  Success rate: %.2f%%", float64(final_success)*100/float64(final_total))
+	}
+	log.Printf("  Throughput: %.2f edges/sec", float64(final_success)/totalDuration.Seconds())
+	log.Printf("  Latency metrics: %s", combinedMetrics.String())
+}
+
+// buildEdgeMutation builds a Spanner mutation for inserting an edge
+func buildEdgeMutation(relType string, sourceUID, targetUID int64, attrs []int64) *spanner.Mutation {
+	// Prepare columns and values for the edge table
+	columns := []string{"uid", "dst_uid"}
+	values := []interface{}{sourceUID, targetUID}
+
+	// Add edge attributes attr101-attr110
+	for i, attr := range attrs {
+		columns = append(columns, fmt.Sprintf("attr%d", 101+i))
+		values = append(values, attr)
+	}
+
+	// Add expire_time for TTL
+	columns = append(columns, "expire_time")
+	values = append(values, spanner.CommitTimestamp)
+
+	return spanner.Insert(relType, columns, values)
+}
+
 // writeVertexWorkerWithMetrics is a worker function for writing vertices with detailed metrics collection
 func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, workerID int, vertices []*VertexData, processingIndices []int, totalVertices int, preGenerate bool, isDurationBased bool, metricsCollector *metrics.ConcurrentMetrics) error {
 	log.Printf("Worker %d started", workerID)
@@ -1294,6 +1399,226 @@ func writeVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, w
 	}
 
 	log.Printf("Worker %d completed: %d success, %d errors", workerID, workerSuccessCount, workerErrorCount)
+	return nil
+}
+
+// writeEdgeWorkerWithMetrics is a worker function for writing edges with detailed metrics collection
+func writeEdgeWorkerWithMetrics(ctx context.Context, client *spanner.Client, workerID int, playerProcessingIndices []int, startZoneID, endZoneID int, batchNum int, isDurationBased bool, metricsCollector *metrics.ConcurrentMetrics) error {
+	log.Printf("Edge Worker %d started", workerID)
+
+	// Configure max commit delay for throughput optimization
+	var applyOpts []spanner.ApplyOption
+	if MaxCommitDelayMs > 0 {
+		maxDelay := time.Duration(MaxCommitDelayMs) * time.Millisecond
+		commitOpts := spanner.CommitOptions{MaxCommitDelay: &maxDelay}
+		applyOpts = []spanner.ApplyOption{
+			spanner.ApplyCommitOptions(commitOpts),
+		}
+		log.Printf("Edge Worker %d using max commit delay: %dms for throughput optimization", workerID, MaxCommitDelayMs)
+	}
+	applyOpts = append(applyOpts, spanner.ApplyAtLeastOnce())
+
+	// Calculate total zones and players
+	totalZones := endZoneID - startZoneID
+	totalPlayers := int64(totalZones * RECORDS_PER_ZONE)
+	playersPerWorker := int(math.Ceil(float64(totalPlayers) / float64(VUS)))
+
+	var stopTimer *time.Timer
+	var done bool = false
+
+	if isDurationBased {
+		stopTimer = time.NewTimer(time.Duration(TEST_DURATION_SEC) * time.Second)
+		defer func() {
+			if stopTimer != nil {
+				stopTimer.Stop()
+			}
+		}()
+
+		go func() {
+			select {
+			case <-stopTimer.C:
+				log.Printf("Edge Worker %d completed due to timer", workerID)
+				done = true
+			case <-ctx.Done():
+				log.Printf("Edge Worker %d completed due to context cancellation", workerID)
+				done = true
+			}
+		}()
+	} else {
+		// Count-based mode: calculate range for this worker
+		workerStartIndex := workerID * playersPerWorker
+		workerEndIndex := (workerID + 1) * playersPerWorker
+		if workerEndIndex > int(totalPlayers) {
+			workerEndIndex = int(totalPlayers)
+		}
+		log.Printf("Edge Worker %d processing players %d to %d", workerID, workerStartIndex, workerEndIndex-1)
+	}
+
+	workerSuccessCount := 0
+	workerErrorCount := 0
+	var playerIndex int = 0
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+
+	for !done {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Printf("Edge Worker %d stopping due to context cancellation", workerID)
+			return ctx.Err()
+		default:
+		}
+
+		var actualPlayerIndex int
+		var playerUID int64
+
+		if isDurationBased {
+			// Duration-based: cycle through players
+			actualPlayerIndex = playerProcessingIndices[playerIndex%len(playerProcessingIndices)]
+			playerIndex++
+		} else {
+			// Count-based: process assigned range
+			workerStartIndex := workerID * playersPerWorker
+			workerEndIndex := (workerID + 1) * playersPerWorker
+			if workerEndIndex > int(totalPlayers) {
+				workerEndIndex = int(totalPlayers)
+			}
+
+			if playerIndex >= (workerEndIndex - workerStartIndex) {
+				done = true
+				break
+			}
+
+			actualPlayerIndex = playerProcessingIndices[workerStartIndex+playerIndex]
+			playerIndex++
+		}
+
+		// Convert actualPlayerIndex to corresponding UID
+		zoneOffset := actualPlayerIndex / RECORDS_PER_ZONE
+		idInZone := actualPlayerIndex%RECORDS_PER_ZONE + 1
+		currentZoneID := startZoneID + zoneOffset
+		playerUID = (int64(currentZoneID) << 40) | int64(idInZone)
+
+		// Create 5 types of relationships for this player
+		relationTypes := []string{"Rel1", "Rel2", "Rel3", "Rel4", "Rel5"}
+
+		// Move batch logic outside relationship loop to respect batchNum
+		var mutations []*spanner.Mutation
+
+		for _, relType := range relationTypes {
+			// Track used targets for this relationship type to prevent duplicates
+			usedTargets := make(map[int64]bool)
+
+			edgesCreated := 0
+			for edgesCreated < EDGES_PER_RELATION {
+				var targetUID int64
+				maxRetries := 100 // Prevent infinite loops
+				found := false
+
+				// Try to find a unique target UID
+				for retry := 0; retry < maxRetries; retry++ {
+					targetZoneID := ZONE_START + rng.Intn(ZONES_TOTAL)
+					targetID := 1 + rng.Intn(RECORDS_PER_ZONE)
+					targetUID = (int64(targetZoneID) << 40) | int64(targetID)
+
+					// Check for self-loops and duplicates
+					if targetUID != playerUID && !usedTargets[targetUID] {
+						usedTargets[targetUID] = true
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					// If we can't find a unique target after maxRetries, log warning and continue
+					log.Printf("Edge Worker %d: Could not find unique target for player %d (%s) after %d retries, created %d/%d edges",
+						workerID, playerUID, relType, maxRetries, edgesCreated, EDGES_PER_RELATION)
+					break
+				}
+
+				// Generate edge attributes attr101-attr110
+				edgeAttrs := make([]int64, 10)
+				for j := 0; j < 10; j++ {
+					edgeAttrs[j] = rng.Int63n(10000)
+				}
+
+				// Build mutation for this edge
+				mutation := buildEdgeMutation(relType, playerUID, targetUID, edgeAttrs)
+				mutations = append(mutations, mutation)
+				edgesCreated++
+
+				// Execute batch when reaching batchNum (respects configured batch size)
+				if len(mutations) >= batchNum {
+					insertStart := time.Now()
+					_, err := client.Apply(ctx, mutations, applyOpts...)
+					insertDuration := time.Since(insertStart)
+
+					// Record metrics - both atomic counters and detailed latency
+					atomic.AddUint64(&totalInserts, uint64(len(mutations)))
+					atomic.AddUint64(&currentTPS, uint64(len(mutations)))
+					metricsCollector.AddDuration(workerID, insertDuration)
+
+					if err != nil {
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						log.Printf("Edge Worker %d batch insert failed for player %d, batch size %d: %s",
+							workerID, playerUID, len(mutations), err.Error())
+						workerErrorCount += len(mutations)
+						atomic.AddUint64(&errorInserts, uint64(len(mutations)))
+						metricsCollector.AddError(int64(len(mutations)))
+					} else {
+						workerSuccessCount += len(mutations)
+						atomic.AddUint64(&successInserts, uint64(len(mutations)))
+						metricsCollector.AddSuccess(int64(len(mutations)))
+					}
+
+					// Reset mutations slice for next batch
+					mutations = []*spanner.Mutation{}
+				}
+			}
+		}
+
+		// Execute any remaining mutations after all relationships for this player
+		if len(mutations) > 0 {
+			insertStart := time.Now()
+			_, err := client.Apply(ctx, mutations, applyOpts...)
+			insertDuration := time.Since(insertStart)
+
+			// Record metrics for the final batch
+			atomic.AddUint64(&totalInserts, uint64(len(mutations)))
+			atomic.AddUint64(&currentTPS, uint64(len(mutations)))
+			metricsCollector.AddDuration(workerID, insertDuration)
+
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				log.Printf("Edge Worker %d final batch insert failed for player %d, batch size %d: %s",
+					workerID, playerUID, len(mutations), err.Error())
+				workerErrorCount += len(mutations)
+				atomic.AddUint64(&errorInserts, uint64(len(mutations)))
+				metricsCollector.AddError(int64(len(mutations)))
+			} else {
+				workerSuccessCount += len(mutations)
+				atomic.AddUint64(&successInserts, uint64(len(mutations)))
+				metricsCollector.AddSuccess(int64(len(mutations)))
+			}
+		}
+
+		// Log progress every 100 players
+		if workerSuccessCount > 0 && workerSuccessCount%500 == 0 {
+			log.Printf("Edge Worker %d processed player %d (UID: %d), success: %d, errors: %d",
+				workerID, playerIndex, playerUID, workerSuccessCount, workerErrorCount)
+		}
+
+		// Small delay to prevent overwhelming the system
+		if !isDurationBased {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	log.Printf("Edge Worker %d completed: %d success, %d errors", workerID, workerSuccessCount, workerErrorCount)
 	return nil
 }
 
@@ -1459,6 +1784,9 @@ func main() {
 	case "write-vertex-improved":
 		log.Println("Running improved vertex write test...")
 		spannerWriteVertexTestImproved(client, PreGenerateVertexData)
+	case "write-edge":
+		log.Printf("Running edge write test for zones [%d, %d)...", startZone, endZone)
+		spannerWriteEdgeTest(client, startZone, endZone, batchNum)
 
 	//case "write-edge":
 	//	log.Printf("Running edge write test for zones [%d, %d)...", startZone, endZone)
