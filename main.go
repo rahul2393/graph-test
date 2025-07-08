@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	"google.golang.org/grpc"
@@ -47,6 +48,9 @@ var (
 	MaxCommitDelayMs       = 100                            // 最大提交延迟(毫秒)，用于提高写入吞吐量
 	BATCH_NUM              = 1                              // 批量写入大小
 	TEST_DURATION_SEC      = 0                              // 测试持续时间(秒)，0表示使用顶点数量模式
+	UseStaleReads          = false                          // 是否使用过期读取
+	StaleReadMode          = "max"                          // 过期读取模式: max, exact
+	StalenessMs            = 15000                          // 过期读取时间(毫秒)
 	instanceID             = "irahul-load-test"
 	GRAPH_NAME             = "g0618"
 	credentialsFile        = "sa2.json"                     // GCP credentials file path
@@ -1622,6 +1626,517 @@ func writeEdgeWorkerWithMetrics(ctx context.Context, client *spanner.Client, wor
 	return nil
 }
 
+// spannerReadRelationTest performs improved edge relation read testing using errgroup and duration-based testing.
+// It scans every vertex within the configured zone range, reads up to 300 destination UIDs connected via
+// Rel1 / Rel4 / Rel5 edges that satisfy attr101>1000, attr102>2000, attr103>4000 and records latency metrics.
+func spannerReadRelationTest(client *spanner.Client, dbPath string) {
+	log.Println("Starting improved Spanner relation read test…")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handleInterrupt(cancel)
+	startTPSMonitor(ctx)
+
+	startTime := time.Now()
+
+	// Initialize detailed metrics collector
+	metricsCollector := metrics.NewConcurrentMetrics(VUS)
+
+	// Reset atomic counters for read metrics
+	atomic.StoreUint64(&totalInserts, 0)
+	atomic.StoreUint64(&successInserts, 0)
+	atomic.StoreUint64(&errorInserts, 0)
+	atomic.StoreUint64(&currentTPS, 0)
+
+	totalVertices := ZONES_TOTAL * RECORDS_PER_ZONE
+
+	// Determine test mode
+	isDurationBased := TEST_DURATION_SEC > 0
+	if isDurationBased {
+		log.Printf("Running duration-based relation read test: %d seconds with %d workers", TEST_DURATION_SEC, VUS)
+	} else {
+		log.Printf("Running count-based relation read test: %d vertices with %d workers", totalVertices, VUS)
+	}
+
+	log.Printf("Starting %d read workers with shared client, dbpath=%s", VUS, dbPath)
+	log.Println("Press Ctrl+C at any time to stop gracefully...")
+	countdownOrExit("开始读取关系", 5)
+
+	group, grpCtx := errgroup.WithContext(ctx)
+
+	// Launch relation read workers
+	for workerID := 0; workerID < VUS; workerID++ {
+		workerID := workerID // capture loop variable
+		group.Go(func() error {
+			return readRelationWorkerWithMetrics(grpCtx, client, workerID, totalVertices, isDurationBased, metricsCollector)
+		})
+	}
+
+	// Wait for all workers to complete
+	if err := group.Wait(); err != nil {
+		log.Printf("Relation read worker error: %v", err)
+	}
+
+	totalDuration := time.Since(startTime)
+	final_total := atomic.LoadUint64(&totalInserts)
+	final_success := atomic.LoadUint64(&successInserts)
+	final_errors := atomic.LoadUint64(&errorInserts)
+
+	// Get combined metrics for detailed latency breakdown
+	combinedMetrics := metricsCollector.CombinedStats()
+	metricsSuccess := metricsCollector.GetSuccessCount()
+	metricsErrors := metricsCollector.GetErrorCount()
+
+	if ctx.Err() != nil {
+		log.Println("Improved relation read test interrupted by user:")
+	} else {
+		log.Println("Improved relation read test completed:")
+	}
+	log.Printf("  Total duration: %v", totalDuration)
+	log.Printf("  Total attempts: %d", final_total)
+	log.Printf("  Expected queries: %d", totalVertices)
+	log.Printf("  Successful queries: %d (metrics: %d)", final_success, metricsSuccess)
+	log.Printf("  Failed queries: %d (metrics: %d)", final_errors, metricsErrors)
+	if final_total > 0 {
+		log.Printf("  Success rate: %.2f%%", float64(final_success)*100/float64(final_total))
+	}
+	log.Printf("  Throughput: %.2f queries/sec", float64(final_success)/totalDuration.Seconds())
+	log.Printf("  Latency metrics: %s", combinedMetrics.String())
+}
+
+// readRelationWorkerWithMetrics is a worker function for reading relations with detailed metrics collection
+func readRelationWorkerWithMetrics(ctx context.Context, client *spanner.Client, workerID int, totalVertices int, isDurationBased bool, metricsCollector *metrics.ConcurrentMetrics) error {
+	log.Printf("Relation Read Worker %d started", workerID)
+
+	var stopTimer *time.Timer
+	var done bool = false
+
+	if isDurationBased {
+		stopTimer = time.NewTimer(time.Duration(TEST_DURATION_SEC) * time.Second)
+		defer func() {
+			if stopTimer != nil {
+				stopTimer.Stop()
+			}
+		}()
+
+		go func() {
+			select {
+			case <-stopTimer.C:
+				log.Printf("Relation Read Worker %d completed due to timer", workerID)
+				done = true
+			case <-ctx.Done():
+				log.Printf("Relation Read Worker %d completed due to context cancellation", workerID)
+				done = true
+			}
+		}()
+	} else {
+		// Count-based mode: calculate range for this worker
+		verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
+		startIdx := workerID * verticesPerWorker
+		endIdx := (workerID + 1) * verticesPerWorker
+		if endIdx > totalVertices {
+			endIdx = totalVertices
+		}
+		log.Printf("Relation Read Worker %d processing vertices %d to %d", workerID, startIdx, endIdx-1)
+	}
+
+	workerSuccessCount := 0
+	workerErrorCount := 0
+	var vertexIndex int = 0
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+
+	const baseSQL = `
+		GRAPH %s
+		MATCH (a:User {uid:@uid})-[e:Rel1|Rel4|Rel5]->(b:User)
+		WHERE e.attr101 > @a101 AND e.attr102 > @a102 AND e.attr103 > @a103
+		RETURN a.uid AS a_uid, a.attr1 AS a_attr1, a.attr2 AS a_attr2, a.attr3 AS a_attr3, a.attr4 AS a_attr4, a.attr5 AS a_attr5, a.attr6 AS a_attr6, a.attr7 AS a_attr7, a.attr8 AS a_attr8, a.attr9 AS a_attr9, a.attr10 AS a_attr10,
+		       a.attr11 AS a_attr11, a.attr12 AS a_attr12, a.attr13 AS a_attr13, a.attr14 AS a_attr14, a.attr15 AS a_attr15, a.attr16 AS a_attr16, a.attr17 AS a_attr17, a.attr18 AS a_attr18, a.attr19 AS a_attr19, a.attr20 AS a_attr20,
+		       a.attr21 AS a_attr21, a.attr22 AS a_attr22, a.attr23 AS a_attr23, a.attr24 AS a_attr24, a.attr25 AS a_attr25, a.attr26 AS a_attr26, a.attr27 AS a_attr27, a.attr28 AS a_attr28, a.attr29 AS a_attr29, a.attr30 AS a_attr30,
+		       a.attr31 AS a_attr31, a.attr32 AS a_attr32, a.attr33 AS a_attr33, a.attr34 AS a_attr34, a.attr35 AS a_attr35, a.attr36 AS a_attr36, a.attr37 AS a_attr37, a.attr38 AS a_attr38, a.attr39 AS a_attr39, a.attr40 AS a_attr40,
+		       a.attr41 AS a_attr41, a.attr42 AS a_attr42, a.attr43 AS a_attr43, a.attr44 AS a_attr44, a.attr45 AS a_attr45, a.attr46 AS a_attr46, a.attr47 AS a_attr47, a.attr48 AS a_attr48, a.attr49 AS a_attr49, a.attr50 AS a_attr50,
+		       a.attr51 AS a_attr51, a.attr52 AS a_attr52, a.attr53 AS a_attr53, a.attr54 AS a_attr54, a.attr55 AS a_attr55, a.attr56 AS a_attr56, a.attr57 AS a_attr57, a.attr58 AS a_attr58, a.attr59 AS a_attr59, a.attr60 AS a_attr60,
+		       a.attr61 AS a_attr61, a.attr62 AS a_attr62, a.attr63 AS a_attr63, a.attr64 AS a_attr64, a.attr65 AS a_attr65, a.attr66 AS a_attr66, a.attr67 AS a_attr67, a.attr68 AS a_attr68, a.attr69 AS a_attr69, a.attr70 AS a_attr70,
+		       a.attr71 AS a_attr71, a.attr72 AS a_attr72, a.attr73 AS a_attr73, a.attr74 AS a_attr74, a.attr75 AS a_attr75, a.attr76 AS a_attr76, a.attr77 AS a_attr77, a.attr78 AS a_attr78, a.attr79 AS a_attr79, a.attr80 AS a_attr80,
+		       a.attr81 AS a_attr81, a.attr82 AS a_attr82, a.attr83 AS a_attr83, a.attr84 AS a_attr84, a.attr85 AS a_attr85, a.attr86 AS a_attr86, a.attr87 AS a_attr87, a.attr88 AS a_attr88, a.attr89 AS a_attr89, a.attr90 AS a_attr90,
+		       a.attr91 AS a_attr91, a.attr92 AS a_attr92, a.attr93 AS a_attr93, a.attr94 AS a_attr94, a.attr95 AS a_attr95, a.attr96 AS a_attr96, a.attr97 AS a_attr97, a.attr98 AS a_attr98, a.attr99 AS a_attr99, a.attr100 AS a_attr100,
+		       b.uid AS b_uid, b.attr1 AS b_attr1, b.attr2 AS b_attr2, b.attr3 AS b_attr3, b.attr4 AS b_attr4, b.attr5 AS b_attr5, b.attr6 AS b_attr6, b.attr7 AS b_attr7, b.attr8 AS b_attr8, b.attr9 AS b_attr9, b.attr10 AS b_attr10,
+		       b.attr11 AS b_attr11, b.attr12 AS b_attr12, b.attr13 AS b_attr13, b.attr14 AS b_attr14, b.attr15 AS b_attr15, b.attr16 AS b_attr16, b.attr17 AS b_attr17, b.attr18 AS b_attr18, b.attr19 AS b_attr19, b.attr20 AS b_attr20,
+		       b.attr21 AS b_attr21, b.attr22 AS b_attr22, b.attr23 AS b_attr23, b.attr24 AS b_attr24, b.attr25 AS b_attr25, b.attr26 AS b_attr26, b.attr27 AS b_attr27, b.attr28 AS b_attr28, b.attr29 AS b_attr29, b.attr30 AS b_attr30,
+		       b.attr31 AS b_attr31, b.attr32 AS b_attr32, b.attr33 AS b_attr33, b.attr34 AS b_attr34, b.attr35 AS b_attr35, b.attr36 AS b_attr36, b.attr37 AS b_attr37, b.attr38 AS b_attr38, b.attr39 AS b_attr39, b.attr40 AS b_attr40,
+		       b.attr41 AS b_attr41, b.attr42 AS b_attr42, b.attr43 AS b_attr43, b.attr44 AS b_attr44, b.attr45 AS b_attr45, b.attr46 AS b_attr46, b.attr47 AS b_attr47, b.attr48 AS b_attr48, b.attr49 AS b_attr49, b.attr50 AS b_attr50,
+		       b.attr51 AS b_attr51, b.attr52 AS b_attr52, b.attr53 AS b_attr53, b.attr54 AS b_attr54, b.attr55 AS b_attr55, b.attr56 AS b_attr56, b.attr57 AS b_attr57, b.attr58 AS b_attr58, b.attr59 AS b_attr59, b.attr60 AS b_attr60,
+		       b.attr61 AS b_attr61, b.attr62 AS b_attr62, b.attr63 AS b_attr63, b.attr64 AS b_attr64, b.attr65 AS b_attr65, b.attr66 AS b_attr66, b.attr67 AS b_attr67, b.attr68 AS b_attr68, b.attr69 AS b_attr69, b.attr70 AS b_attr70,
+		       b.attr71 AS b_attr71, b.attr72 AS b_attr72, b.attr73 AS b_attr73, b.attr74 AS b_attr74, b.attr75 AS b_attr75, b.attr76 AS b_attr76, b.attr77 AS b_attr77, b.attr78 AS b_attr78, b.attr79 AS b_attr79, b.attr80 AS b_attr80,
+		       b.attr81 AS b_attr81, b.attr82 AS b_attr82, b.attr83 AS b_attr83, b.attr84 AS b_attr84, b.attr85 AS b_attr85, b.attr86 AS b_attr86, b.attr87 AS b_attr87, b.attr88 AS b_attr88, b.attr89 AS b_attr89, b.attr90 AS b_attr90,
+		       b.attr91 AS b_attr91, b.attr92 AS b_attr92, b.attr93 AS b_attr93, b.attr94 AS b_attr94, b.attr95 AS b_attr95, b.attr96 AS b_attr96, b.attr97 AS b_attr97, b.attr98 AS b_attr98, b.attr99 AS b_attr99, b.attr100 AS b_attr100
+		LIMIT 300`
+
+	for !done {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Printf("Relation Read Worker %d stopping due to context cancellation", workerID)
+			return ctx.Err()
+		default:
+		}
+
+		var idx int
+		var uid int64
+
+		if isDurationBased {
+			// Duration-based: cycle through vertices
+			idx = vertexIndex % totalVertices
+			vertexIndex++
+		} else {
+			// Count-based: process assigned range
+			verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
+			startIdx := workerID * verticesPerWorker
+			endIdx := (workerID + 1) * verticesPerWorker
+			if endIdx > totalVertices {
+				endIdx = totalVertices
+			}
+
+			if vertexIndex >= (endIdx - startIdx) {
+				done = true
+				break
+			}
+
+			idx = startIdx + vertexIndex
+			vertexIndex++
+		}
+
+		// Derive UID from idx
+		zoneOffset := idx / RECORDS_PER_ZONE
+		idInZone := idx%RECORDS_PER_ZONE + 1
+		zoneID := ZONE_START + zoneOffset
+		uid = (int64(zoneID) << 40) | int64(idInZone)
+
+		stmt := spanner.Statement{
+			SQL: fmt.Sprintf(baseSQL, GRAPH_NAME), // stable text!
+			Params: map[string]interface{}{ // literals become params
+				"uid":  uid,
+				"a101": rng.Intn(10000),
+				"a102": rng.Intn(10000),
+				"a103": rng.Intn(10000),
+			},
+		}
+
+		var ro *spanner.ReadOnlyTransaction
+		queryStart := time.Now()
+		// Create a new single-use read-only transaction for each query
+		// Create a new single-use read-only transaction for each query
+		if UseStaleReads {
+			// Configure stale read based on settings
+			if StaleReadMode == "max" {
+				// Maximum staleness - read data that's at most N milliseconds old
+				ro = client.Single().WithTimestampBound(
+					spanner.MaxStaleness(time.Duration(StalenessMs) * time.Millisecond))
+			} else if StaleReadMode == "exact" {
+				// Exact staleness - read data that's exactly N milliseconds old
+				ro = client.Single().WithTimestampBound(
+					spanner.ExactStaleness(time.Duration(StalenessMs) * time.Millisecond))
+			}
+		} else {
+			// Use strong consistency (default)
+			ro = client.Single()
+		}
+		iterRows := ro.Query(ctx, stmt)
+
+		// Consume rows and capture errors
+		rowCnt := 0
+		success := true
+		for {
+			_, err := iterRows.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Printf("Relation Read Worker %d query failed for uid %d: %v", workerID, uid, err)
+				success = false
+				break
+			}
+			// printSpannerRow(row)
+			rowCnt++
+		}
+		iterRows.Stop()
+		ro.Close() // Close the transaction after each query
+
+		// Measure the complete query duration including result consumption
+		queryDuration := time.Since(queryStart)
+
+		// Record metrics - both atomic counters and detailed latency
+		atomic.AddUint64(&totalInserts, 1)
+		atomic.AddUint64(&currentTPS, 1)
+		metricsCollector.AddDuration(workerID, queryDuration)
+
+		if success {
+			workerSuccessCount++
+			atomic.AddUint64(&successInserts, 1)
+			metricsCollector.AddSuccess(1)
+		} else {
+			workerErrorCount++
+			atomic.AddUint64(&errorInserts, 1)
+			metricsCollector.AddError(1)
+		}
+
+		// Log progress every 500 queries
+		if workerSuccessCount > 0 && workerSuccessCount%500 == 0 {
+			log.Printf("Relation Read Worker %d, iter %d, uid %d, query time: %v, rows: %d", workerID, vertexIndex, uid, queryDuration, rowCnt)
+		}
+
+		// Small delay to prevent overwhelming the system
+		if !isDurationBased {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	log.Printf("Relation Read Worker %d completed: %d success, %d errors", workerID, workerSuccessCount, workerErrorCount)
+	return nil
+}
+
+func spannerReadVertexTest(client *spanner.Client) {
+	log.Println("Starting improved Spanner read vertex test...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handleInterrupt(cancel)
+	startTPSMonitor(ctx)
+
+	startTime := time.Now()
+
+	// Initialize detailed metrics collector
+	metricsCollector := metrics.NewConcurrentMetrics(VUS)
+
+	// Reset atomic counters for read metrics
+	atomic.StoreUint64(&totalInserts, 0)
+	atomic.StoreUint64(&successInserts, 0)
+	atomic.StoreUint64(&errorInserts, 0)
+	atomic.StoreUint64(&currentTPS, 0)
+
+	// Total queries to execute
+	totalQueries := 1000000
+
+	// Determine test mode
+	isDurationBased := TEST_DURATION_SEC > 0
+	if isDurationBased {
+		log.Printf("Running duration-based vertex read test: %d seconds with %d workers", TEST_DURATION_SEC, VUS)
+	} else {
+		log.Printf("Running count-based vertex read test: %d queries with %d workers", totalQueries, VUS)
+	}
+
+	log.Printf("Starting %d vertex read workers...", VUS)
+	log.Println("Press Ctrl+C at any time to stop gracefully...")
+	countdownOrExit("开始读顶点", 5)
+
+	group, grpCtx := errgroup.WithContext(ctx)
+
+	// Launch vertex read workers
+	for workerID := 0; workerID < VUS; workerID++ {
+		workerID := workerID // capture loop variable
+		group.Go(func() error {
+			return readVertexWorkerWithMetrics(grpCtx, client, workerID, totalQueries, isDurationBased, metricsCollector)
+		})
+	}
+
+	// Wait for all workers to complete
+	if err := group.Wait(); err != nil {
+		log.Printf("Vertex read worker error: %v", err)
+	}
+
+	totalDuration := time.Since(startTime)
+	final_total := atomic.LoadUint64(&totalInserts)
+	final_success := atomic.LoadUint64(&successInserts)
+	final_errors := atomic.LoadUint64(&errorInserts)
+
+	// Get combined metrics for detailed latency breakdown
+	combinedMetrics := metricsCollector.CombinedStats()
+	metricsSuccess := metricsCollector.GetSuccessCount()
+	metricsErrors := metricsCollector.GetErrorCount()
+
+	if ctx.Err() != nil {
+		log.Println("Improved vertex read test interrupted by user:")
+	} else {
+		log.Println("Improved vertex read test completed:")
+	}
+	log.Printf("  Total duration: %v", totalDuration)
+	log.Printf("  Total attempts: %d", final_total)
+	log.Printf("  Expected queries: %d", totalQueries)
+	log.Printf("  Successful queries: %d (metrics: %d)", final_success, metricsSuccess)
+	log.Printf("  Failed queries: %d (metrics: %d)", final_errors, metricsErrors)
+	if final_total > 0 {
+		log.Printf("  Success rate: %.2f%%", float64(final_success)*100/float64(final_total))
+	}
+	log.Printf("  Throughput: %.2f queries/sec", float64(final_success)/totalDuration.Seconds())
+	log.Printf("  Latency metrics: %s", combinedMetrics.String())
+}
+
+// readVertexWorkerWithMetrics is a worker function for reading vertices with detailed metrics collection
+func readVertexWorkerWithMetrics(ctx context.Context, client *spanner.Client, workerID int, totalQueries int, isDurationBased bool, metricsCollector *metrics.ConcurrentMetrics) error {
+	log.Printf("Vertex Read Worker %d started", workerID)
+
+	var stopTimer *time.Timer
+	var done bool = false
+
+	if isDurationBased {
+		stopTimer = time.NewTimer(time.Duration(TEST_DURATION_SEC) * time.Second)
+		defer func() {
+			if stopTimer != nil {
+				stopTimer.Stop()
+			}
+		}()
+
+		go func() {
+			select {
+			case <-stopTimer.C:
+				log.Printf("Vertex Read Worker %d completed due to timer", workerID)
+				done = true
+			case <-ctx.Done():
+				log.Printf("Vertex Read Worker %d completed due to context cancellation", workerID)
+				done = true
+			}
+		}()
+	} else {
+		// Count-based mode: calculate range for this worker
+		queriesPerWorker := int(math.Ceil(float64(totalQueries) / float64(VUS)))
+		startIdx := workerID * queriesPerWorker
+		endIdx := (workerID + 1) * queriesPerWorker
+		if endIdx > totalQueries {
+			endIdx = totalQueries
+		}
+		log.Printf("Vertex Read Worker %d processing queries %d to %d", workerID, startIdx, endIdx-1)
+	}
+
+	workerSuccessCount := 0
+	workerErrorCount := 0
+	var queryIndex int = 0
+
+	// Create random generator for this worker
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+
+	for !done {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Printf("Vertex Read Worker %d stopping due to context cancellation", workerID)
+			return ctx.Err()
+		default:
+		}
+
+		if !isDurationBased {
+			// Count-based: process assigned range
+			queriesPerWorker := int(math.Ceil(float64(totalQueries) / float64(VUS)))
+			startIdx := workerID * queriesPerWorker
+			endIdx := (workerID + 1) * queriesPerWorker
+			if endIdx > totalQueries {
+				endIdx = totalQueries
+			}
+
+			if queryIndex >= (endIdx - startIdx) {
+				done = true
+				break
+			}
+		}
+
+		// Generate random values for WHERE clause [0,9999)
+		attr11Value := rng.Intn(9999)
+		attr12Value := rng.Intn(9999)
+		attr13Value := rng.Intn(9999)
+		var sql string
+		//sql = `SELECT * FROM Users
+		//		  WHERE attr11 = @attr11 AND attr12 > @attr12 AND attr13 > @attr13
+		//		  LIMIT 300`
+		//sql = `SELECT uid FROM Users
+		//		  WHERE attr11 = @attr11 AND attr12 > @attr12 AND attr13 > @attr13
+		//		  LIMIT 300`
+		sql = `Select * from Users where uid in (SELECT uid FROM Users
+				  WHERE attr11 = @attr11 AND attr12 > @attr12 AND attr13 > @attr13
+				  LIMIT 300)`
+		// Build parameterized query
+		stmt := spanner.Statement{
+			SQL: sql,
+			Params: map[string]interface{}{
+				"attr11": int64(attr11Value),
+				"attr12": int64(attr12Value),
+				"attr13": int64(attr13Value),
+			},
+		}
+		var ro *spanner.ReadOnlyTransaction
+
+		queryStart := time.Now()
+		// Create a new single-use read-only transaction for each query
+		if UseStaleReads {
+			// Configure stale read based on settings
+			if StaleReadMode == "max" {
+				// Maximum staleness - read data that's at most N milliseconds old
+				ro = client.Single().WithTimestampBound(
+					spanner.MaxStaleness(time.Duration(StalenessMs) * time.Millisecond))
+			} else if StaleReadMode == "exact" {
+				// Exact staleness - read data that's exactly N milliseconds old
+				ro = client.Single().WithTimestampBound(
+					spanner.ExactStaleness(time.Duration(StalenessMs) * time.Millisecond))
+			}
+		} else {
+			// Use strong consistency (default)
+			ro = client.Single()
+		}
+		iterRows := ro.Query(ctx, stmt)
+
+		// Count rows and consume results
+		rowCount := 0
+		success := true
+		for {
+			_, err := iterRows.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Printf("Vertex Read Worker %d query failed: %v", workerID, err)
+				success = false
+				break
+			}
+			rowCount++
+		}
+		iterRows.Stop()
+		ro.Close() // Close the transaction after each query
+
+		queryDuration := time.Since(queryStart)
+
+		// Record metrics - both atomic counters and detailed latency
+		atomic.AddUint64(&totalInserts, 1)
+		atomic.AddUint64(&currentTPS, 1)
+		metricsCollector.AddDuration(workerID, queryDuration)
+
+		if success {
+			workerSuccessCount++
+			atomic.AddUint64(&successInserts, 1)
+			metricsCollector.AddSuccess(1)
+		} else {
+			workerErrorCount++
+			atomic.AddUint64(&errorInserts, 1)
+			metricsCollector.AddError(1)
+		}
+
+		queryIndex++
+
+		// Log progress every 100 queries
+		if workerSuccessCount > 0 && workerSuccessCount%100 == 0 {
+			log.Printf("Vertex Read Worker %d, iter %d, attr11=%d, attr12>%d, attr13>%d, query time: %v, rows: %d",
+				workerID, queryIndex, attr11Value, attr12Value, attr13Value, queryDuration, rowCount)
+		}
+
+		// Small delay to prevent overwhelming the system
+		if !isDurationBased {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	log.Printf("Vertex Read Worker %d completed: %d success, %d errors", workerID, workerSuccessCount, workerErrorCount)
+	return nil
+}
+
 // AddGFELatencyUnaryInterceptor intercepts unary client requests and adds GFE latency to existing spans
 func AddGFELatencyUnaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn,
 	invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
@@ -1709,14 +2224,23 @@ func main() {
 	var testType string
 	var startZone, endZone int
 	var batchNum int
+	var useStaleReads bool
+	var staleReadMode string
+	var stalenessMs int
 	flag.StringVar(&testType, "test", "setup", "Test type to run: setup, setupindex, write-vertex, write-vertex-improved, delete-vertex-using-pdml, write-edge, relation, all")
 	flag.IntVar(&startZone, "start-zone", ZONE_START, "Start zone ID for edge test")
 	flag.IntVar(&endZone, "end-zone", ZONE_START+ZONES_TOTAL, "End zone ID for edge test")
 	flag.IntVar(&batchNum, "batch-num", EDGES_PER_RELATION, "Number of edges per batch for edge write test")
+	flag.BoolVar(&useStaleReads, "stale-reads", UseStaleReads, "Enable stale reads for read operations")
+	flag.StringVar(&staleReadMode, "stale-mode", StaleReadMode, "Stale read mode: max or exact")
+	flag.IntVar(&stalenessMs, "staleness-ms", StalenessMs, "Staleness time in milliseconds")
 	flag.Parse()
 
 	ctx := context.Background()
-
+	// Update global variables from command line flags
+	UseStaleReads = useStaleReads
+	StaleReadMode = staleReadMode
+	StalenessMs = stalenessMs
 	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, databaseID)
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS", "true")
 	os.Setenv("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW", "true")
@@ -1730,7 +2254,11 @@ func main() {
 		//option.WithCredentialsFile(credentialsFile),
 		option.WithGRPCConnectionPool(16),
 		//option.WithGRPCDialOption(grpc.WithUnaryInterceptor(AddGFELatencyUnaryInterceptor)),
-		//option.WithGRPCDialOption(grpc.WithStreamInterceptor(AddGFELatencyStreamingInterceptor)),
+		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(64*1024*1024), // Larger buffers
+			grpc.MaxCallSendMsgSize(64*1024*1024),
+		)),
+		option.WithGRPCDialOption(grpc.WithStreamInterceptor(AddGFELatencyStreamingInterceptor)),
 	}
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{
 		SessionPoolConfig: spanner.SessionPoolConfig{MaxOpened: 1, MinOpened: 1},
@@ -1787,19 +2315,13 @@ func main() {
 	case "write-edge":
 		log.Printf("Running edge write test for zones [%d, %d)...", startZone, endZone)
 		spannerWriteEdgeTest(client, startZone, endZone, batchNum)
+	case "read-relation":
+		log.Println("Running relation read test...")
+		spannerReadRelationTest(client, dbPath)
 
-	//case "write-edge":
-	//	log.Printf("Running edge write test for zones [%d, %d)...", startZone, endZone)
-	//	spannerWriteEdgeTest(client, startZone, endZone, batchNum)
-	//
-	//case "read-relation":
-	//	log.Println("Running relation read test...")
-	//	spannerReadRelationTest(ctx, dbPath)
-	//
-	//case "read-vertex":
-	//	log.Println("Running vertex read test...")
-	//	spannerReadVertexTest(client)
-	//
+	case "read-vertex":
+		log.Println("Running vertex read test...")
+		spannerReadVertexTest(client)
 	//case "all":
 	//	log.Println("Running all tests...")
 	//
